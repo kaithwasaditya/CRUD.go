@@ -1,0 +1,120 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Task API",
+    "version": "1.0.0",
+    "description": "A small in-memory CRUD API for managing a to-do list, built in Go."
+  },
+  "servers": [{ "url": "/" }],
+  "paths": {
+    "/": {
+      "get": {
+        "summary": "API info",
+        "responses": { "200": { "description": "Describes the API" } }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "responses": { "200": { "description": "Server is alive" } }
+      }
+    },
+    "/tasks": {
+      "get": {
+        "summary": "List all tasks",
+        "parameters": [
+          { "name": "done", "in": "query", "schema": { "type": "boolean" }, "description": "Filter by completion status" },
+          { "name": "search", "in": "query", "schema": { "type": "string" }, "description": "Filter by title substring" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Array of tasks",
+            "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/Task" } } } }
+          }
+        }
+      },
+      "post": {
+        "summary": "Create a task",
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NewTask" } } }
+        },
+        "responses": {
+          "201": {
+            "description": "Task created",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } }
+          },
+          "400": { "description": "Missing or empty title" }
+        }
+      }
+    },
+    "/tasks/{id}": {
+      "get": {
+        "summary": "Get a single task",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": {
+          "200": { "description": "The task", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } } },
+          "404": { "description": "Task not found" }
+        }
+      },
+      "put": {
+        "summary": "Replace a task",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "requestBody": {
+          "required": true,
+          "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NewTaskWithDone" } } }
+        },
+        "responses": {
+          "200": { "description": "Updated task", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Task" } } } },
+          "400": { "description": "Missing or empty title" },
+          "404": { "description": "Task not found" }
+        }
+      },
+      "delete": {
+        "summary": "Delete a task",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } }],
+        "responses": {
+          "204": { "description": "Deleted, no content" },
+          "404": { "description": "Task not found" }
+        }
+      }
+    },
+    "/stats": {
+      "get": {
+        "summary": "Task statistics",
+        "responses": { "200": { "description": "Counts of total/done/open tasks" } }
+      }
+    },
+    "/reset": {
+      "post": {
+        "summary": "Reset to the 3 seed tasks",
+        "responses": { "200": { "description": "The reset task list" } }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Task": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "integer" },
+          "title": { "type": "string" },
+          "done": { "type": "boolean" }
+        }
+      },
+      "NewTask": {
+        "type": "object",
+        "required": ["title"],
+        "properties": { "title": { "type": "string", "example": "Buy milk" } }
+      },
+      "NewTaskWithDone": {
+        "type": "object",
+        "required": ["title"],
+        "properties": {
+          "title": { "type": "string", "example": "Buy milk" },
+          "done": { "type": "boolean", "example": false }
+        }
+      }
+    }
+  }
+}
