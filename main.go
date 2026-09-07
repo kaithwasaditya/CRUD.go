@@ -9,10 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	_ "modernc.org/sqlite"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
-
-// ---------- Data model + SQLite store ----------
 
 type Task struct {
 	ID    int    `json:"id"`
@@ -20,55 +18,34 @@ type Task struct {
 	Done  bool   `json:"done"`
 }
 
-type Store struct {
+// TaskRepository contains the database operations used by the API.
+// An in-memory repository or a Postgres repository can both implement it.
+type TaskRepository interface {
+	List() ([]Task, error)
+	Get(id int) (Task, bool, error)
+	Create(title string) (Task, error)
+	Update(id int, title string, done bool) (Task, bool, error)
+	Delete(id int) (bool, error)
+}
+
+type PostgresRepository struct {
 	db *sql.DB
 }
 
-func NewStore(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+func NewPostgresRepository(databaseURL string) (*PostgresRepository, error) {
+	db, err := sql.Open("pgx", databaseURL)
 	if err != nil {
 		return nil, err
 	}
-
-	store := &Store{db: db}
-	if err := store.initialize(); err != nil {
+	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, err
 	}
-	return store, nil
+	return &PostgresRepository{db: db}, nil
 }
 
-func (s *Store) initialize() error {
-	_, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS tasks (
-			id INTEGER PRIMARY KEY,
-			title TEXT NOT NULL,
-			done BOOLEAN NOT NULL
-		)
-	`)
-	if err != nil {
-		return err
-	}
-
-	var count int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM tasks").Scan(&count); err != nil {
-		return err
-	}
-	if count != 0 {
-		return nil
-	}
-
-	_, err = s.db.Exec(
-		"INSERT INTO tasks (title, done) VALUES (?, ?), (?, ?), (?, ?)",
-		"Buy milk", false,
-		"Write README", false,
-		"Learn Go", true,
-	)
-	return err
-}
-
-func (s *Store) list() ([]Task, error) {
-	rows, err := s.db.Query("SELECT id, title, done FROM tasks ORDER BY id")
+func (r *PostgresRepository) List() ([]Task, error) {
+	rows, err := r.db.Query("SELECT id, title, done FROM tasks ORDER BY id")
 	if err != nil {
 		return nil, err
 	}
@@ -85,64 +62,56 @@ func (s *Store) list() ([]Task, error) {
 	return tasks, rows.Err()
 }
 
-func (s *Store) get(id int) (Task, bool, error) {
+func (r *PostgresRepository) Get(id int) (Task, bool, error) {
 	var task Task
-	err := s.db.QueryRow("SELECT id, title, done FROM tasks WHERE id = ?", id).Scan(&task.ID, &task.Title, &task.Done)
+	err := r.db.QueryRow("SELECT id, title, done FROM tasks WHERE id = $1", id).Scan(&task.ID, &task.Title, &task.Done)
 	if err == sql.ErrNoRows {
 		return Task{}, false, nil
 	}
 	return task, err == nil, err
 }
 
-func (s *Store) create(title string) (Task, error) {
-	result, err := s.db.Exec("INSERT INTO tasks (title, done) VALUES (?, ?)", title, false)
-	if err != nil {
-		return Task{}, err
-	}
-	id, err := result.LastInsertId()
-	if err != nil {
-		return Task{}, err
-	}
-	return Task{ID: int(id), Title: title, Done: false}, nil
+func (r *PostgresRepository) Create(title string) (Task, error) {
+	var task Task
+	err := r.db.QueryRow(
+		"INSERT INTO tasks (title, done) VALUES ($1, $2) RETURNING id, title, done",
+		title, false,
+	).Scan(&task.ID, &task.Title, &task.Done)
+	return task, err
 }
 
-func (s *Store) update(id int, title string, done bool) (Task, bool, error) {
-	result, err := s.db.Exec("UPDATE tasks SET title = ?, done = ? WHERE id = ?", title, done, id)
-	if err != nil {
-		return Task{}, false, err
-	}
-	updated, err := result.RowsAffected()
-	if err != nil {
-		return Task{}, false, err
-	}
-	if updated == 0 {
+func (r *PostgresRepository) Update(id int, title string, done bool) (Task, bool, error) {
+	var task Task
+	err := r.db.QueryRow(
+		"UPDATE tasks SET title = $1, done = $2 WHERE id = $3 RETURNING id, title, done",
+		title, done, id,
+	).Scan(&task.ID, &task.Title, &task.Done)
+	if err == sql.ErrNoRows {
 		return Task{}, false, nil
 	}
-	return Task{ID: id, Title: title, Done: done}, true, nil
+	return task, err == nil, err
 }
 
-func (s *Store) delete(id int) (bool, error) {
-	result, err := s.db.Exec("DELETE FROM tasks WHERE id = ?", id)
-	if err != nil {
-		return false, err
+func (r *PostgresRepository) Delete(id int) (bool, error) {
+	var deletedID int
+	err := r.db.QueryRow("DELETE FROM tasks WHERE id = $1 RETURNING id", id).Scan(&deletedID)
+	if err == sql.ErrNoRows {
+		return false, nil
 	}
-	deleted, err := result.RowsAffected()
-	return deleted > 0, err
+	return err == nil, err
 }
 
-// ---------- JSON helpers ----------
-
-func writeJSON(w http.ResponseWriter, status int, v any) {
+func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_ = json.NewEncoder(w).Encode(value)
 }
 
-func writeErr(w http.ResponseWriter, status int, msg string) {
-	writeJSON(w, status, map[string]string{"error": msg})
+func writeErr(w http.ResponseWriter, status int, message string) {
+	writeJSON(w, status, map[string]string{"error": message})
 }
 
-func idFromPath(w http.ResponseWriter, path string) (int, bool) {
+func taskID(w http.ResponseWriter, path string) (int, bool) {
 	idText := strings.TrimPrefix(path, "/tasks/")
 	if idText == "" || strings.Contains(idText, "/") {
 		writeErr(w, http.StatusNotFound, "not found")
@@ -156,29 +125,15 @@ func idFromPath(w http.ResponseWriter, path string) (int, bool) {
 	return id, true
 }
 
-// ---------- Handlers ----------
-
-func rootHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{
-		"name":    "Task API",
-		"version": "1.0",
-		"endpoints": []string{
-			"GET /tasks", "GET /tasks/{id}", "POST /tasks",
-			"PUT /tasks/{id}", "DELETE /tasks/{id}",
-		},
-	})
-}
-
-func makeTasksHandler(store *Store) http.HandlerFunc {
+func makeTasksHandler(repository TaskRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			tasks, err := store.list()
+			tasks, err := repository.List()
 			if err != nil {
 				writeErr(w, http.StatusInternalServerError, "database error")
 				return
 			}
-
 			writeJSON(w, http.StatusOK, tasks)
 
 		case http.MethodPost:
@@ -194,12 +149,12 @@ func makeTasksHandler(store *Store) http.HandlerFunc {
 				writeErr(w, http.StatusBadRequest, "title is required")
 				return
 			}
-			created, err := store.create(title)
+			task, err := repository.Create(title)
 			if err != nil {
 				writeErr(w, http.StatusInternalServerError, "database error")
 				return
 			}
-			writeJSON(w, http.StatusCreated, created)
+			writeJSON(w, http.StatusCreated, task)
 
 		default:
 			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -207,16 +162,16 @@ func makeTasksHandler(store *Store) http.HandlerFunc {
 	}
 }
 
-func makeTaskByIDHandler(store *Store) http.HandlerFunc {
+func makeTaskHandler(repository TaskRepository) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		id, ok := idFromPath(w, r.URL.Path)
+		id, ok := taskID(w, r.URL.Path)
 		if !ok {
 			return
 		}
 
 		switch r.Method {
 		case http.MethodGet:
-			t, found, err := store.get(id)
+			task, found, err := repository.Get(id)
 			if err != nil {
 				writeErr(w, http.StatusInternalServerError, "database error")
 				return
@@ -225,7 +180,7 @@ func makeTaskByIDHandler(store *Store) http.HandlerFunc {
 				writeErr(w, http.StatusNotFound, "Task not found")
 				return
 			}
-			writeJSON(w, http.StatusOK, t)
+			writeJSON(w, http.StatusOK, task)
 
 		case http.MethodPut:
 			var body struct {
@@ -241,7 +196,7 @@ func makeTaskByIDHandler(store *Store) http.HandlerFunc {
 				writeErr(w, http.StatusBadRequest, "title is required")
 				return
 			}
-			updated, found, err := store.update(id, title, body.Done)
+			task, found, err := repository.Update(id, title, body.Done)
 			if err != nil {
 				writeErr(w, http.StatusInternalServerError, "database error")
 				return
@@ -250,10 +205,10 @@ func makeTaskByIDHandler(store *Store) http.HandlerFunc {
 				writeErr(w, http.StatusNotFound, "Task not found")
 				return
 			}
-			writeJSON(w, http.StatusOK, updated)
+			writeJSON(w, http.StatusOK, task)
 
 		case http.MethodDelete:
-			deleted, err := store.delete(id)
+			deleted, err := repository.Delete(id)
 			if err != nil {
 				writeErr(w, http.StatusInternalServerError, "database error")
 				return
@@ -270,33 +225,29 @@ func makeTaskByIDHandler(store *Store) http.HandlerFunc {
 	}
 }
 
-func newMux(store *Store) *http.ServeMux {
+func newMux(repository TaskRepository) *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/" {
-			http.NotFound(w, r)
-			return
-		}
-		rootHandler(w, r)
-	})
-	mux.HandleFunc("/tasks", makeTasksHandler(store))
-	mux.HandleFunc("/tasks/", makeTaskByIDHandler(store))
+	mux.HandleFunc("/tasks", makeTasksHandler(repository))
+	mux.HandleFunc("/tasks/", makeTaskHandler(repository))
 	return mux
 }
 
 func main() {
-	store, err := NewStore("tasks.db")
-	if err != nil {
-		log.Fatalf("initialize database: %v", err)
+	databaseURL := os.Getenv("DATABASE_URL")
+	if databaseURL == "" {
+		log.Fatal("DATABASE_URL is required")
 	}
-	defer store.db.Close()
 
-	mux := newMux(store)
+	repository, err := NewPostgresRepository(databaseURL)
+	if err != nil {
+		log.Fatalf("connect to database: %v", err)
+	}
+	defer repository.db.Close()
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 	log.Printf("Task API listening on http://localhost:%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Fatal(http.ListenAndServe(":"+port, newMux(repository)))
 }

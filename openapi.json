@@ -3,7 +3,7 @@
   "info": {
     "title": "Task API",
     "version": "1.0.0",
-    "description": "A SQLite-backed CRUD API for managing a to-do list, built in Go."
+    "description": "A Postgres-backed CRUD API for managing a to-do list, built in Go."
   },
   "servers": [{ "url": "/" }],
   "paths": {

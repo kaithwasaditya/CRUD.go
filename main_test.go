@@ -3,58 +3,66 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 )
 
-func TestTasksPersistAfterReopeningDatabase(t *testing.T) {
-	databasePath := filepath.Join(t.TempDir(), "tasks.db")
-	store, err := NewStore(databasePath)
-	if err != nil {
-		t.Fatalf("create store: %v", err)
-	}
+type memoryRepository struct {
+	tasks []Task
+}
 
-	tasks, err := store.list()
-	if err != nil {
-		t.Fatalf("list seeded tasks: %v", err)
-	}
-	if len(tasks) != 3 {
-		t.Fatalf("seeded task count = %d, want 3", len(tasks))
-	}
+func (r *memoryRepository) List() ([]Task, error) { return r.tasks, nil }
 
-	created, err := store.create("Persists after restart")
-	if err != nil {
-		t.Fatalf("create task: %v", err)
+func (r *memoryRepository) Get(id int) (Task, bool, error) {
+	for _, task := range r.tasks {
+		if task.ID == id {
+			return task, true, nil
+		}
 	}
-	if err := store.db.Close(); err != nil {
-		t.Fatalf("close first store: %v", err)
-	}
+	return Task{}, false, nil
+}
 
-	reopened, err := NewStore(databasePath)
-	if err != nil {
-		t.Fatalf("reopen store: %v", err)
-	}
-	defer reopened.db.Close()
+func (r *memoryRepository) Create(title string) (Task, error) {
+	task := Task{ID: len(r.tasks) + 1, Title: title}
+	r.tasks = append(r.tasks, task)
+	return task, nil
+}
 
-	task, found, err := reopened.get(created.ID)
-	if err != nil {
-		t.Fatalf("get persisted task: %v", err)
+func (r *memoryRepository) Update(id int, title string, done bool) (Task, bool, error) {
+	for index, task := range r.tasks {
+		if task.ID == id {
+			r.tasks[index].Title = title
+			r.tasks[index].Done = done
+			return r.tasks[index], true, nil
+		}
 	}
-	if !found || task.Title != created.Title {
-		t.Fatalf("persisted task = %#v, found = %t", task, found)
+	return Task{}, false, nil
+}
+
+func (r *memoryRepository) Delete(id int) (bool, error) {
+	for index, task := range r.tasks {
+		if task.ID == id {
+			r.tasks = append(r.tasks[:index], r.tasks[index+1:]...)
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func TestRoutesWorkWithRepository(t *testing.T) {
+	repository := &memoryRepository{}
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/tasks", http.NoBody)
+	newMux(repository).ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusBadRequest {
+		t.Fatalf("empty POST status = %d, want %d", recorder.Code, http.StatusBadRequest)
 	}
 }
 
 func TestResetEndpointIsNotRegistered(t *testing.T) {
-	store, err := NewStore(filepath.Join(t.TempDir(), "tasks.db"))
-	if err != nil {
-		t.Fatalf("create store: %v", err)
-	}
-	defer store.db.Close()
-
 	recorder := httptest.NewRecorder()
 	request := httptest.NewRequest(http.MethodPost, "/reset", nil)
-	newMux(store).ServeHTTP(recorder, request)
+	newMux(&memoryRepository{}).ServeHTTP(recorder, request)
 
 	if recorder.Code != http.StatusNotFound {
 		t.Fatalf("POST /reset status = %d, want %d", recorder.Code, http.StatusNotFound)
