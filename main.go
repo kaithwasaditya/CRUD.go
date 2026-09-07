@@ -1,18 +1,18 @@
 package main
 
 import (
+	"database/sql"
 	"encoding/json"
 	"log"
 	"net/http"
 	"os"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
-	"sync"
+
+	_ "modernc.org/sqlite"
 )
 
-// ---------- Stage 2: data model + in-memory "database" ----------
+// ---------- Data model + SQLite store ----------
 
 type Task struct {
 	ID    int    `json:"id"`
@@ -21,78 +21,113 @@ type Task struct {
 }
 
 type Store struct {
-	mu     sync.Mutex
-	tasks  []Task
-	nextID int
+	db *sql.DB
 }
 
-func NewStore() *Store {
-	s := &Store{}
-	s.reset()
-	return s
-}
-
-// reset seeds the store back to its 3 example tasks (used at boot and by POST /reset)
-func (s *Store) reset() {
-	s.tasks = []Task{
-		{ID: 1, Title: "Buy milk", Done: false},
-		{ID: 2, Title: "Write README", Done: false},
-		{ID: 3, Title: "Learn Go", Done: true},
+func NewStore(path string) (*Store, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
 	}
-	s.nextID = 4
+
+	store := &Store{db: db}
+	if err := store.initialize(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return store, nil
 }
 
-func (s *Store) list() []Task {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]Task, len(s.tasks))
-	copy(out, s.tasks)
-	return out
+func (s *Store) initialize() error {
+	_, err := s.db.Exec(`
+		CREATE TABLE IF NOT EXISTS tasks (
+			id INTEGER PRIMARY KEY,
+			title TEXT NOT NULL,
+			done BOOLEAN NOT NULL
+		)
+	`)
+	if err != nil {
+		return err
+	}
+
+	var count int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM tasks").Scan(&count); err != nil {
+		return err
+	}
+	if count != 0 {
+		return nil
+	}
+
+	_, err = s.db.Exec(
+		"INSERT INTO tasks (title, done) VALUES (?, ?), (?, ?), (?, ?)",
+		"Buy milk", false,
+		"Write README", false,
+		"Learn Go", true,
+	)
+	return err
 }
 
-func (s *Store) get(id int) (Task, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, t := range s.tasks {
-		if t.ID == id {
-			return t, true
+func (s *Store) list() ([]Task, error) {
+	rows, err := s.db.Query("SELECT id, title, done FROM tasks ORDER BY id")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	tasks := []Task{}
+	for rows.Next() {
+		var task Task
+		if err := rows.Scan(&task.ID, &task.Title, &task.Done); err != nil {
+			return nil, err
 		}
+		tasks = append(tasks, task)
 	}
-	return Task{}, false
+	return tasks, rows.Err()
 }
 
-func (s *Store) create(title string) Task {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	t := Task{ID: s.nextID, Title: title, Done: false}
-	s.nextID++
-	s.tasks = append(s.tasks, t)
-	return t
+func (s *Store) get(id int) (Task, bool, error) {
+	var task Task
+	err := s.db.QueryRow("SELECT id, title, done FROM tasks WHERE id = ?", id).Scan(&task.ID, &task.Title, &task.Done)
+	if err == sql.ErrNoRows {
+		return Task{}, false, nil
+	}
+	return task, err == nil, err
 }
 
-func (s *Store) update(id int, title string, done bool) (Task, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i, t := range s.tasks {
-		if t.ID == id {
-			s.tasks[i].Title = title
-			s.tasks[i].Done = done
-			return s.tasks[i], true
-		}
+func (s *Store) create(title string) (Task, error) {
+	result, err := s.db.Exec("INSERT INTO tasks (title, done) VALUES (?, ?)", title, false)
+	if err != nil {
+		return Task{}, err
 	}
-	return Task{}, false
+	id, err := result.LastInsertId()
+	if err != nil {
+		return Task{}, err
+	}
+	return Task{ID: int(id), Title: title, Done: false}, nil
 }
 
-func (s *Store) delete(id int) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i, t := range s.tasks {
-		if t.ID == id {
-			s.tasks = append(s.tasks[:i], s.tasks[i+1:]...)
-			return true
-		}
+func (s *Store) update(id int, title string, done bool) (Task, bool, error) {
+	result, err := s.db.Exec("UPDATE tasks SET title = ?, done = ? WHERE id = ?", title, done, id)
+	if err != nil {
+		return Task{}, false, err
 	}
-	return false
+	updated, err := result.RowsAffected()
+	if err != nil {
+		return Task{}, false, err
+	}
+	if updated == 0 {
+		return Task{}, false, nil
+	}
+	return Task{ID: id, Title: title, Done: done}, true, nil
+}
+
+func (s *Store) delete(id int) (bool, error) {
+	result, err := s.db.Exec("DELETE FROM tasks WHERE id = ?", id)
+	if err != nil {
+		return false, err
+	}
+	deleted, err := result.RowsAffected()
+	return deleted > 0, err
 }
 
 // ---------- JSON helpers ----------
@@ -107,17 +142,13 @@ func writeErr(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// idFromPath extracts the trailing /tasks/{id} segment and parses it as an int.
-// Returns ok=false with the response already written if the path is malformed.
-var taskIDPath = regexp.MustCompile(`^/tasks/([^/]+)$`)
-
 func idFromPath(w http.ResponseWriter, path string) (int, bool) {
-	m := taskIDPath.FindStringSubmatch(path)
-	if m == nil {
+	idText := strings.TrimPrefix(path, "/tasks/")
+	if idText == "" || strings.Contains(idText, "/") {
 		writeErr(w, http.StatusNotFound, "not found")
 		return 0, false
 	}
-	id, err := strconv.Atoi(m[1])
+	id, err := strconv.Atoi(idText)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "id must be a number")
 		return 0, false
@@ -134,45 +165,18 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 		"endpoints": []string{
 			"GET /tasks", "GET /tasks/{id}", "POST /tasks",
 			"PUT /tasks/{id}", "DELETE /tasks/{id}",
-			"GET /stats", "POST /reset",
 		},
 	})
-}
-
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func makeTasksHandler(store *Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			tasks := store.list()
-
-			// ★ extras: ?done=true and ?search=milk query params
-			if doneParam := r.URL.Query().Get("done"); doneParam != "" {
-				wantDone, err := strconv.ParseBool(doneParam)
-				if err != nil {
-					writeErr(w, http.StatusBadRequest, "done must be true or false")
-					return
-				}
-				filtered := tasks[:0:0]
-				for _, t := range tasks {
-					if t.Done == wantDone {
-						filtered = append(filtered, t)
-					}
-				}
-				tasks = filtered
-			}
-			if search := r.URL.Query().Get("search"); search != "" {
-				filtered := tasks[:0:0]
-				needle := strings.ToLower(search)
-				for _, t := range tasks {
-					if strings.Contains(strings.ToLower(t.Title), needle) {
-						filtered = append(filtered, t)
-					}
-				}
-				tasks = filtered
+			tasks, err := store.list()
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "database error")
+				return
 			}
 
 			writeJSON(w, http.StatusOK, tasks)
@@ -190,7 +194,11 @@ func makeTasksHandler(store *Store) http.HandlerFunc {
 				writeErr(w, http.StatusBadRequest, "title is required")
 				return
 			}
-			created := store.create(title)
+			created, err := store.create(title)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "database error")
+				return
+			}
 			writeJSON(w, http.StatusCreated, created)
 
 		default:
@@ -208,9 +216,13 @@ func makeTaskByIDHandler(store *Store) http.HandlerFunc {
 
 		switch r.Method {
 		case http.MethodGet:
-			t, found := store.get(id)
+			t, found, err := store.get(id)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "database error")
+				return
+			}
 			if !found {
-				writeErr(w, http.StatusNotFound, "Task "+strconv.Itoa(id)+" not found")
+				writeErr(w, http.StatusNotFound, "Task not found")
 				return
 			}
 			writeJSON(w, http.StatusOK, t)
@@ -229,16 +241,25 @@ func makeTaskByIDHandler(store *Store) http.HandlerFunc {
 				writeErr(w, http.StatusBadRequest, "title is required")
 				return
 			}
-			updated, found := store.update(id, title, body.Done)
+			updated, found, err := store.update(id, title, body.Done)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "database error")
+				return
+			}
 			if !found {
-				writeErr(w, http.StatusNotFound, "Task "+strconv.Itoa(id)+" not found")
+				writeErr(w, http.StatusNotFound, "Task not found")
 				return
 			}
 			writeJSON(w, http.StatusOK, updated)
 
 		case http.MethodDelete:
-			if !store.delete(id) {
-				writeErr(w, http.StatusNotFound, "Task "+strconv.Itoa(id)+" not found")
+			deleted, err := store.delete(id)
+			if err != nil {
+				writeErr(w, http.StatusInternalServerError, "database error")
+				return
+			}
+			if !deleted {
+				writeErr(w, http.StatusNotFound, "Task not found")
 				return
 			}
 			w.WriteHeader(http.StatusNoContent)
@@ -249,42 +270,7 @@ func makeTaskByIDHandler(store *Store) http.HandlerFunc {
 	}
 }
 
-// ★ extra: GET /stats
-func makeStatsHandler(store *Store) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		tasks := store.list()
-		done := 0
-		for _, t := range tasks {
-			if t.Done {
-				done++
-			}
-		}
-		writeJSON(w, http.StatusOK, map[string]int{
-			"total": len(tasks),
-			"done":  done,
-			"open":  len(tasks) - done,
-		})
-	}
-}
-
-// ★ extra: POST /reset
-func makeResetHandler(store *Store) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeErr(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		store.mu.Lock()
-		store.reset()
-		store.mu.Unlock()
-		writeJSON(w, http.StatusOK, store.list())
-	}
-}
-
-func main() {
-	store := NewStore()
-	_ = sort.Strings // (kept import used if you extend sorting later)
-
+func newMux(store *Store) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -293,20 +279,24 @@ func main() {
 		}
 		rootHandler(w, r)
 	})
-	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/tasks", makeTasksHandler(store))
 	mux.HandleFunc("/tasks/", makeTaskByIDHandler(store))
-	mux.HandleFunc("/stats", makeStatsHandler(store))
-	mux.HandleFunc("/reset", makeResetHandler(store))
+	return mux
+}
 
-	// Stage 5: Swagger UI + the OpenAPI spec it reads
-	mux.Handle("/openapi.json", http.FileServer(http.Dir("static")))
-	mux.Handle("/docs/", http.StripPrefix("/docs/", http.FileServer(http.Dir("static/swagger-ui"))))
+func main() {
+	store, err := NewStore("tasks.db")
+	if err != nil {
+		log.Fatalf("initialize database: %v", err)
+	}
+	defer store.db.Close()
+
+	mux := newMux(store)
 
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-	log.Printf("Task API listening on http://localhost:%s (docs at /docs/)", port)
+	log.Printf("Task API listening on http://localhost:%s", port)
 	log.Fatal(http.ListenAndServe(":"+port, mux))
 }

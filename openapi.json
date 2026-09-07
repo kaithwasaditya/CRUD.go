@@ -3,7 +3,7 @@
   "info": {
     "title": "Task API",
     "version": "1.0.0",
-    "description": "A small in-memory CRUD API for managing a to-do list, built in Go."
+    "description": "A SQLite-backed CRUD API for managing a to-do list, built in Go."
   },
   "servers": [{ "url": "/" }],
   "paths": {
@@ -13,19 +13,9 @@
         "responses": { "200": { "description": "Describes the API" } }
       }
     },
-    "/health": {
-      "get": {
-        "summary": "Health check",
-        "responses": { "200": { "description": "Server is alive" } }
-      }
-    },
     "/tasks": {
       "get": {
         "summary": "List all tasks",
-        "parameters": [
-          { "name": "done", "in": "query", "schema": { "type": "boolean" }, "description": "Filter by completion status" },
-          { "name": "search", "in": "query", "schema": { "type": "string" }, "description": "Filter by title substring" }
-        ],
         "responses": {
           "200": {
             "description": "Array of tasks",
@@ -77,18 +67,6 @@
           "204": { "description": "Deleted, no content" },
           "404": { "description": "Task not found" }
         }
-      }
-    },
-    "/stats": {
-      "get": {
-        "summary": "Task statistics",
-        "responses": { "200": { "description": "Counts of total/done/open tasks" } }
-      }
-    },
-    "/reset": {
-      "post": {
-        "summary": "Reset to the 3 seed tasks",
-        "responses": { "200": { "description": "The reset task list" } }
       }
     }
   },
